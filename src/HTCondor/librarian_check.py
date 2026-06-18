@@ -16,16 +16,17 @@ Checks:
   search     - Look up a specific ClusterId.ProcId
   throughput - Jobs completed per day (bar chart)
   histogram  - Distribution of cluster sizes (jobs per cluster)
+  dags       - N most recent DAGs (clusters, jobs, batch info, timing)
   all        - Run all checks (default)
 
 Options:
   --db PATH              Path to library.db (default: from HTCondor config)
-  --user NAME            Filter jobs/recent by username
-  --since DATE           Filter recent/throughput by date (YYYY-MM-DD)
-  --until DATE           Filter recent/throughput by date (YYYY-MM-DD)
+  --user NAME            Filter jobs/recent/dags by username
+  --since DATE           Filter recent/throughput/dags by date (YYYY-MM-DD)
+  --until DATE           Filter recent/throughput/dags by date (YYYY-MM-DD)
   --cluster ID           Cluster ID for cluster/search checks
   --proc ID              Proc ID for search check
-  --n N                  Number of jobs for recent check (default: 20)
+  --n N                  Number of jobs/DAGs for recent/dags check (default: 20)
   --days N               Number of days for throughput check (default: 30)
   --stale-threshold N    Seconds before daemon is considered stale (default: auto)
   --watch N              Re-run check every N seconds
@@ -76,9 +77,12 @@ def backlog_color(n):
     if n > 10_000:  return caution(s)
     return good(s)
 
+_HIGH_WATER_PCT = 97.0
+_LOW_WATER_PCT  = 80.0
+
 def pct_color(pct, s):
-    if pct >= 97: return bad(s)
-    if pct >= 80: return caution(s)
+    if pct >= _HIGH_WATER_PCT: return bad(s)
+    if pct >= _LOW_WATER_PCT:  return caution(s)
     return good(s)
 
 def file_status_color(status):
@@ -222,9 +226,9 @@ def check_summary(con, args):
             warnings.append(f"{sd['TotalRecordsLost']:,} records lost on insert failure")
 
         db_cur, db_max, db_pct = db_size_info(args)
-        if db_pct >= 97:
+        if db_pct >= _HIGH_WATER_PCT:
             criticals.append(f"DB at {db_pct:.0f}% of max ({fmt_size(db_cur)} / {fmt_size(db_max)})")
-        elif db_pct >= 80:
+        elif db_pct >= _LOW_WATER_PCT:
             warnings.append(f"DB at {db_pct:.0f}% of max ({fmt_size(db_cur)} / {fmt_size(db_max)})")
 
     level = "CRIT" if criticals else ("WARN" if warnings else "OK")
@@ -352,7 +356,8 @@ def check_users(con, args):
 
 
 def check_status(con, args):
-    sd = con.execute("SELECT * FROM StatusData WHERE StatusDataId = 1").fetchone()
+    sd  = con.execute("SELECT * FROM StatusData WHERE StatusDataId = 1").fetchone()
+    sd2 = con.execute("SELECT * FROM StatusData WHERE StatusDataId = 2").fetchone()
     cycles = con.execute("""
         SELECT TimeOfUpdate, TotalRecordsRead, JobBacklogEstimate, DurationMs,
                GarbageCollectionRun, HitMaxIngestLimit, RecordsLostOnInsertFailure
@@ -375,7 +380,7 @@ def check_status(con, args):
         age_sec = datetime.now().timestamp() - last_ts
 
     if args.format == "json":
-        return {
+        result = {
             "last_update": fmt_time(sd["TimeOfLastUpdate"]) if sd else None,
             "age_seconds": round(age_sec, 1) if age_sec is not None else None,
             "stale": (age_sec is not None and age_sec > args.stale_threshold),
@@ -398,6 +403,14 @@ def check_status(con, args):
                 for r in cycles
             ],
         }
+        if sd2:
+            result["counter_overflow_snapshot"] = {
+                "total_cycles": sd2["TotalCycles"],
+                "total_ads_ingested": sd2["TotalAdsIngested"],
+                "total_records_lost": sd2["TotalRecordsLost"],
+                "last_update": fmt_time(sd2["TimeOfLastUpdate"]),
+            }
+        return result
 
     print_header("Status Overview")
     if sd:
@@ -447,6 +460,17 @@ def check_status(con, args):
         print(f"    {lbl('Hit ingest cap rate      :')} {caution(cap_pct)}{cap_note}")
         lb_note = f"  {note('<-- still catching up')}" if left_backlog else ""
         print(f"    {lbl('Last run left backlog    :')} {yesno(left_backlog, warn_on_yes=True)}{lb_note}")
+
+        if sd2:
+            print()
+            print(f"  {caution('Counter overflow detected — cumulative counters have been reset.')}")
+            print(f"  {bold('Pre-reset snapshot (row 2):')}")
+            lost2 = sd2["TotalRecordsLost"] or 0
+            lost2_str = bad(f"{lost2:,}") if lost2 > 0 else dim(f"{lost2:,}")
+            print(val(f"    Total cycles (pre-reset)   : {sd2['TotalCycles']:,}"))
+            print(val(f"    Total ingested (pre-reset) : {sd2['TotalAdsIngested']:,}"))
+            print(f"    {lbl('Records lost (pre-reset)  :')} {lost2_str}")
+            print(f"    {lbl('Snapshot timestamp        :')} {ts(fmt_time(sd2['TimeOfLastUpdate']))}")
     else:
         print(f"  {caution('No StatusData found — librarian may not have run yet.')}")
 
@@ -704,7 +728,8 @@ def check_cluster(con, args):
 
     cluster_id = args.cluster
     rows = con.execute("""
-        SELECT j.ProcId, u.UserName, j.TimeOfCreation, jr.CompletionDate, f.FileName, jr.Offset
+        SELECT j.ProcId, u.UserName, j.TimeOfCreation, jr.CompletionDate, f.FileName, jr.Offset,
+               jr.DAGManJobId, jr.JobBatchId, jr.JobBatchName
         FROM Jobs j
         LEFT JOIN Users u       ON j.UserId  = u.UserId
         LEFT JOIN JobRecords jr ON j.JobId   = jr.JobId
@@ -723,7 +748,10 @@ def check_cluster(con, args):
                                 if (r["CompletionDate"] and r["CompletionDate"] > 0
                                     and r["TimeOfCreation"] and r["TimeOfCreation"] > 0)
                                 else None),
-                            "file": r["FileName"], "offset": r["Offset"]} for r in rows]}
+                            "file": r["FileName"], "offset": r["Offset"],
+                            "dag_job_id": r["DAGManJobId"],
+                            "job_batch_id": r["JobBatchId"],
+                            "job_batch_name": r["JobBatchName"]} for r in rows]}
 
     print_header(f"Cluster {cluster_id}  —  {len(rows)} proc(s) indexed")
     if not rows:
@@ -743,6 +771,18 @@ def check_cluster(con, args):
         wt    = val(f"{wall:>10}")
         fn    = fname(display_filename(r['FileName']))
         print(f"  {pr}  {u} {cr} {cmp} {wt}  {fn}")
+        dag_parts = []
+        if r["DAGManJobId"] is not None:
+            dag_parts.append(f"DAGMan job: {r['DAGManJobId']}")
+        if r["JobBatchName"] is not None:
+            batch = r["JobBatchName"]
+            if r["JobBatchId"] is not None:
+                batch += f" (id: {r['JobBatchId']})"
+            dag_parts.append(f"batch: {batch}")
+        elif r["JobBatchId"] is not None:
+            dag_parts.append(f"batch id: {r['JobBatchId']}")
+        if dag_parts:
+            print(f"  {'':>7}  {dim('  ' + '  |  '.join(dag_parts))}")
 
 
 def check_search(con, args):
@@ -758,7 +798,8 @@ def check_search(con, args):
 
     rows = con.execute(f"""
         SELECT j.ClusterId, j.ProcId, u.UserName, j.TimeOfCreation,
-               jr.CompletionDate, f.FileName, jr.Offset
+               jr.CompletionDate, f.FileName, jr.Offset,
+               jr.DAGManJobId, jr.JobBatchId, jr.JobBatchName
         FROM Jobs j
         LEFT JOIN Users u       ON j.UserId  = u.UserId
         LEFT JOIN JobRecords jr ON j.JobId   = jr.JobId
@@ -777,7 +818,10 @@ def check_search(con, args):
             {"cluster": r["ClusterId"], "proc": r["ProcId"], "user": r["UserName"],
              "created": fmt_time(r["TimeOfCreation"]),
              "completed": fmt_time(r["CompletionDate"]),
-             "file": r["FileName"], "offset": r["Offset"]}
+             "file": r["FileName"], "offset": r["Offset"],
+             "dag_job_id": r["DAGManJobId"],
+             "job_batch_id": r["JobBatchId"],
+             "job_batch_name": r["JobBatchName"]}
             for r in rows
         ]}
 
@@ -799,6 +843,18 @@ def check_search(con, args):
         off = val(f"{r['Offset']:>12,}" if r["Offset"] is not None else f"{'N/A':>12}")
         fn  = fname(display_filename(r['FileName']))
         print(f"  {cl} {pr}  {u} {cr} {cmp} {off}  {fn}")
+        dag_parts = []
+        if r["DAGManJobId"] is not None:
+            dag_parts.append(f"DAGMan job: {r['DAGManJobId']}")
+        if r["JobBatchName"] is not None:
+            batch = r["JobBatchName"]
+            if r["JobBatchId"] is not None:
+                batch += f" (id: {r['JobBatchId']})"
+            dag_parts.append(f"batch: {batch}")
+        elif r["JobBatchId"] is not None:
+            dag_parts.append(f"batch id: {r['JobBatchId']}")
+        if dag_parts:
+            print(f"  {'':>10} {'':>7}  {dim('  ' + '  |  '.join(dag_parts))}")
 
 
 def check_throughput(con, args):
@@ -945,6 +1001,126 @@ def check_histogram(con, args):
         print(f"  {label_str}  {bar}  {count_str}")
 
 
+def check_dags(con, args):
+    n = args.n
+
+    clauses, params = ["jr.DAGManJobId IS NOT NULL"], []
+    if args.user:
+        clauses.append("u.UserName = ?")
+        params.append(args.user)
+    if args.since:
+        clauses.append("jr.CompletionDate >= ?")
+        params.append(args.since)
+    if args.until:
+        clauses.append("jr.CompletionDate <= ?")
+        params.append(args.until)
+
+    where = "WHERE " + " AND ".join(clauses)
+
+    total = con.execute(f"""
+        SELECT COUNT(DISTINCT jr.DAGManJobId)
+        FROM JobRecords jr
+        JOIN Jobs j       ON jr.JobId = j.JobId
+        LEFT JOIN Users u ON j.UserId = u.UserId
+        {where}
+    """, params).fetchone()[0]
+
+    rows = con.execute(f"""
+        SELECT jr.DAGManJobId,
+               MAX(jr.JobBatchName)         AS JobBatchName,
+               MAX(jr.JobBatchId)           AS JobBatchId,
+               COUNT(DISTINCT j.ClusterId)  AS clusters,
+               COUNT(DISTINCT j.JobId)      AS jobs,
+               MAX(u.UserName)              AS UserName,
+               MIN(CASE WHEN jr.CompletionDate > 0 THEN jr.CompletionDate END) AS earliest,
+               MAX(CASE WHEN jr.CompletionDate > 0 THEN jr.CompletionDate END) AS latest,
+               EXISTS (
+                   SELECT 1 FROM Jobs dag_j
+                   JOIN JobRecords dag_jr ON dag_j.JobId = dag_jr.JobId
+                   WHERE dag_j.ClusterId = jr.DAGManJobId
+               ) AS dag_self_recorded
+        FROM JobRecords jr
+        JOIN Jobs j       ON jr.JobId = j.JobId
+        LEFT JOIN Users u ON j.UserId = u.UserId
+        {where}
+        GROUP BY jr.DAGManJobId
+        ORDER BY latest DESC
+        LIMIT ?
+    """, params + [n]).fetchall()
+
+    if args.format == "json":
+        filters = {"user": args.user, "since": args.since, "until": args.until, "n": n}
+        return {
+            "total_dags": total,
+            "filters": filters,
+            "dags": [
+                {
+                    "dag_job_id":       r["DAGManJobId"],
+                    "dag_self_recorded": bool(r["dag_self_recorded"]),
+                    "job_batch_id":     r["JobBatchId"],
+                    "job_batch_name":   r["JobBatchName"],
+                    "clusters":         r["clusters"],
+                    "jobs":             r["jobs"],
+                    "user":             r["UserName"],
+                    "first_completed":  fmt_time(r["earliest"]),
+                    "last_completed":   fmt_time(r["latest"]),
+                    "duration": fmt_duration(
+                        (r["latest"] - r["earliest"])
+                        if (r["latest"] and r["earliest"]
+                            and r["latest"] > 0 and r["earliest"] > 0)
+                        else None
+                    ),
+                }
+                for r in rows
+            ],
+        }
+
+    title = f"DAG Summary  (most recent {n})"
+    filters = []
+    if args.user:  filters.append(f"user: {args.user}")
+    if args.since: filters.append(f"since: {fmt_time(args.since)}")
+    if args.until: filters.append(f"until: {fmt_time(args.until)}")
+    if filters:
+        title += f"  —  {', '.join(filters)}"
+    print_header(title, width=80)
+    print(f"  {lbl('Total DAGs recorded:')} {val(str(total))}")
+    print()
+
+    if not rows:
+        print(f"  {dim('No DAG records found matching the given filters.')}")
+        return
+
+    dag_hdr = (f"{'DAGManJobId':>12} {'Rec':>3} {'Clusters':>8} {'Jobs':>7}  "
+               f"{'User':<20} {'Batch':<24} {'Last Completed':<22} Duration")
+    print(f"  {bold(dag_hdr)}")
+    print(f"  {sep(107)}")
+    for r in rows:
+        valid_dur = (r["latest"] and r["earliest"]
+                     and r["latest"] > 0 and r["earliest"] > 0)
+        dur = fmt_duration(r["latest"] - r["earliest"]) if valid_dur else "-"
+
+        if r["JobBatchName"]:
+            batch_raw = r["JobBatchName"]
+            if r["JobBatchId"] is not None:
+                batch_raw += f" [{r['JobBatchId']}]"
+        elif r["JobBatchId"] is not None:
+            batch_raw = str(r["JobBatchId"])
+        else:
+            batch_raw = "-"
+        batch = (batch_raw[:21] + "...") if len(batch_raw) > 24 else batch_raw
+
+        recorded = bool(r["dag_self_recorded"])
+        dag_id   = cid(f"{r['DAGManJobId']:>12}")
+        rec_str  = good(" Y ") if recorded else caution(" N ")
+        cl_str   = val(f"{r['clusters']:>8,}")
+        job_str  = val(f"{r['jobs']:>7,}")
+        u_str    = uname(f"{(r['UserName'] or 'N/A'):<20}")
+        b_str    = fname(f"{batch:<24}")
+        t_str    = ts(f"{fmt_time(r['latest']):<22}")
+        dur_str  = val(dur)
+        print(f"  {dag_id} {rec_str} {cl_str} {job_str}  {u_str} {b_str} {t_str} {dur_str}")
+
+
 # ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
@@ -961,6 +1137,7 @@ CHECKS = {
     "search":     check_search,
     "throughput": check_throughput,
     "histogram":  check_histogram,
+    "dags":       check_dags,
 }
 
 # checks excluded from 'all' since they need specific args or are summaries
@@ -987,7 +1164,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Check the HTCondor librarian database.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="checks: summary, jobs, users, status, files, backlog, recent, cluster, search, throughput, histogram, all",
+        epilog="checks: summary, jobs, users, status, files, backlog, recent, cluster, search, throughput, histogram, dags, all",
     )
     parser.add_argument("check", choices=[*CHECKS.keys(), "all"],
                         nargs="?", default="all",
@@ -1004,8 +1181,8 @@ def main():
                         help="Cluster ID for cluster/search checks")
     parser.add_argument("--proc",             metavar="ID", type=int,
                         help="Proc ID for search check")
-    parser.add_argument("--n",                metavar="N", type=int, default=20,
-                        help="Number of jobs for recent check (default: 20)")
+    parser.add_argument("--n",                metavar="N", type=int, default=10,
+                        help="Number of results for recent/dags checks (default: 10)")
     parser.add_argument("--days",             metavar="N", type=int, default=30,
                         help="Number of days for throughput check (default: 30)")
     parser.add_argument("--stale-threshold",  metavar="N", type=int, default=0,
@@ -1020,6 +1197,18 @@ def main():
     if not args.db:
         print("ERROR: LIBRARIAN_DATABASE not set in HTCondor config. Use --db PATH.")
         sys.exit(1)
+
+    global _HIGH_WATER_PCT, _LOW_WATER_PCT
+    try:
+        hi = float(htcondor2.param.get("LIBRARIAN_HIGH_WATER_MARK") or 0)
+        _HIGH_WATER_PCT = hi * 100 if 0 < hi <= 1.0 else 97.0
+    except (ValueError, TypeError):
+        pass
+    try:
+        lo = float(htcondor2.param.get("LIBRARIAN_LOW_WATER_MARK") or 0)
+        _LOW_WATER_PCT = lo * 100 if 0 < lo <= 1.0 else 80.0
+    except (ValueError, TypeError):
+        pass
 
     # Resolve stale threshold: explicit flag wins, otherwise auto
     if args.stale_threshold <= 0:
